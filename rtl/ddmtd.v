@@ -247,3 +247,98 @@ module ddmtd_pairing #(
         end
     end
 endmodule
+
+// Stage 3: modular subtraction, window-local nearest-neighbor unwrapping,
+// 16-pair signed boxcar average, and normalized MOD-1000 output.
+// All inputs are synchronous to clk. No division or remainder operators.
+module ddmtd_phase_math (
+    input  wire       clk,
+    input  wire       rst,
+    input  wire       pair_reinit,
+    input  wire [9:0] pair_tag_a,
+    input  wire [9:0] pair_tag_b,
+    input  wire       pair_valid,
+    output reg  [9:0] avg_phase,
+    output reg        avg_valid
+);
+    // Input tag difference is always in [-999,+999].
+    wire signed [11:0] tag_diff =
+        $signed({2'b00, pair_tag_a}) - $signed({2'b00, pair_tag_b});
+    wire signed [11:0] raw_signed =
+        (tag_diff < 12'sd0) ? tag_diff + 12'sd1000 : tag_diff;
+    wire [9:0] raw_phase = raw_signed[9:0];
+
+    reg [9:0] prev_raw;
+    // First raw phase of the current 16-pair window.
+    reg [9:0] window_base;
+    reg [3:0] sample_count;
+    // At most 15 steps of magnitude 500: local_offset in [-7500,+7485].
+    reg signed [13:0] local_offset;
+    // Local sample = first phase [0,999] + offset => [-7500,+8484].
+    // A 20-bit sum comfortably covers 16 such samples.
+    reg signed [19:0] sum;
+
+    wire signed [11:0] raw_step =
+        $signed({2'b00, raw_phase}) - $signed({2'b00, prev_raw});
+    wire signed [11:0] step =
+        (raw_step < -12'sd500) ? raw_step + 12'sd1000 :
+        (raw_step >= 12'sd500) ? raw_step - 12'sd1000 : raw_step;
+    wire signed [13:0] extended_step = {{2{step[11]}}, step};
+    wire signed [13:0] next_offset = local_offset + extended_step;
+    wire signed [14:0] local_sample =
+        $signed({5'b00000, window_base}) +
+        $signed({next_offset[13], next_offset});
+    wire signed [19:0] sample_extended = {{5{local_sample[14]}}, local_sample};
+    wire signed [19:0] first_sample = $signed({10'b0, raw_phase});
+    wire signed [19:0] next_sum =
+        (sample_count == 4'd0) ? first_sample : (sum + sample_extended);
+    wire signed [19:0] mean = next_sum >>> 4;
+
+    // Mean lies within [-7500,8499]. Convert magnitude to a positive
+    // remainder using a fixed sequence of compare/subtract operations.
+    // This avoids inferring a general-purpose signed modulo divider.
+    wire mean_negative = mean[19];
+    wire [13:0] magnitude = mean_negative ? -mean[13:0] : mean[13:0];
+    wire [13:0] r8 = (magnitude >= 14'd8000) ? magnitude - 14'd8000 : magnitude;
+    wire [13:0] r4 = (r8 >= 14'd4000) ? r8 - 14'd4000 : r8;
+    wire [13:0] r2 = (r4 >= 14'd2000) ? r4 - 14'd2000 : r4;
+    wire [13:0] r1 = (r2 >= 14'd1000) ? r2 - 14'd1000 : r2;
+    wire [9:0] normalized =
+        (mean_negative && (r1 != 14'd0)) ? (10'd1000 - r1[9:0]) : r1[9:0];
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            prev_raw <= 10'd0;
+            window_base <= 10'd0;
+            sample_count <= 4'd0;
+            local_offset <= 14'sd0;
+            sum <= 20'sd0;
+            avg_phase <= 10'd0;
+            avg_valid <= 1'b0;
+        end else begin
+            avg_valid <= 1'b0;
+            if (pair_reinit) begin
+                prev_raw <= 10'd0;
+                window_base <= 10'd0;
+                sample_count <= 4'd0;
+                local_offset <= 14'sd0;
+                sum <= 20'sd0;
+            end else if (pair_valid) begin
+                prev_raw <= raw_phase;
+                if (sample_count == 4'd0)
+                    window_base <= raw_phase;
+                if (sample_count == 4'd15) begin
+                    avg_phase <= normalized;
+                    avg_valid <= 1'b1;
+                    sample_count <= 4'd0;
+                    local_offset <= 14'sd0;
+                    sum <= 20'sd0;
+                end else begin
+                    sample_count <= sample_count + 4'd1;
+                    local_offset <= (sample_count == 4'd0) ? 14'sd0 : next_offset;
+                    sum <= next_sum;
+                end
+            end
+        end
+    end
+endmodule
