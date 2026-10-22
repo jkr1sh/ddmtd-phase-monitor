@@ -124,7 +124,7 @@ The threshold is programmable through `in[5:2]` (effective 1..15), common to bot
 
 The implemented threshold convention requires H consecutive samples for qualification. The candidate timestamp is captured on the first high sample and incremented modulo 1000 for each subsequent zero until stable-high qualification completes.
 
-**Remaining verification:** Complete the programmable-threshold sweep, check exact publication latency, and investigate pathological sampled sequences that never achieve stable-high qualification. These are verification limitations, not unresolved architectural decisions.ng watchdog must use actual event/report timing appropriately, not confuse them.
+**Remaining verification:** Complete the programmable-threshold sweep, check exact publication latency, and investigate pathological sampled sequences that never achieve stable-high qualification. These are verification limitations, not unresolved architectural decisions.
 
 ## 7. Sequential tag pairing and health monitoring
 
@@ -184,28 +184,207 @@ On `pair_valid`, calculate:
 
 Perform subtraction in an explicitly widened signed representation, then add/subtract 1000 as required. Do not use truncation of a 10-bit subtraction, because that implements MOD 1024. This block is independent of temporal unwrapping and has its own self-checking corner-case tests.
 
-## 9. Temporal unwrapping and local averaging
+## 9. Temporal Phase Unwrapping and Local Averaging
 
-Consecutive raw differential phases `z[n]` are circular. Compute the shortest nearest-neighbor increment:
+### 9.1 Objective
 
-```text
-d = z[n] - z[n-1]
-if d < -500: delta = d + 1000
-else if d >= 500: delta = d - 1000
-else: delta = d
+The phase-processing block receives valid pairs of BVM-corrected timestamps and produces a 16-sample averaged differential phase measurement.
+
+Each accepted pair generates one raw modular phase:
+
+\[
+z_n=(t_{A,n}-t_{B,n})\bmod1000
+\]
+
+The phase processor performs nearest-neighbor temporal unwrapping to maintain local phase continuity across the modulo boundary before averaging.
+
+The output is reduced modulo 1000 to represent relative phase within one nominal input-clock period.
+
+The core does not maintain a persistent phase-cycle counter or an unbounded accumulated phase trajectory.
+
+### 9.2 Nearest-Neighbor Delta Unwrapping
+
+For consecutive raw phase measurements:
+
+\[
+d_n=z_n-z_{n-1}
+\]
+
+The corrected phase increment is:
+
+\[
+\Delta_n=
+\begin{cases}
+d_n+1000,&d_n<-500\\
+d_n-1000,&d_n\ge500\\
+d_n,&\text{otherwise}
+\end{cases}
+\]
+
+The resulting increments lie within `[-500,499]`.
+
+An exactly 500-count difference is ambiguous. The implementation resolves this tie in the negative direction.
+
+Correct unwrapping assumes that the actual phase change between consecutive accepted measurements is less than half a beat, with sufficient margin for measurement noise.
+
+### 9.3 Window-Local Phase Reconstruction
+
+Each averaging window contains 16 accepted differential phase measurements.
+
+The first measurement establishes the window reference:
+
+\[
+B=z_0
+\]
+
+The register `window_base` stores this value.
+
+The cumulative local offset is:
+
+\[
+O_0=0,\qquad O_n=O_{n-1}+\Delta_n
+\]
+
+The locally unwrapped phase is reconstructed as:
+
+\[
+\Phi_n=B+O_n
+\]
+
+The offset is relative to the first measurement of the current window, not the current raw phase.
+
+Therefore, the implementation must use `window_base + next_offset`, not `raw_phase + next_offset`.
+
+At each new averaging window, `window_base` and the local offset are reinitialized. No accumulated phase-cycle history is retained across windows.
+
+### 9.4 Register Widths
+
+| Quantity | Width | Range or justification |
+|---|---|---|
+| Input timestamps | 10-bit unsigned | 0–999 |
+| Signed timestamp difference | 12-bit signed | −999 to +999 |
+| Raw modular phase | 10-bit unsigned | 0–999 |
+| Previous raw phase | 10-bit unsigned | 0–999 |
+| Nearest-neighbor delta | 12-bit signed | −500 to +499 |
+| Local offset | 14-bit signed | −7500 to +7485 |
+| Local phase sample | 15-bit signed | Conservative range −7500 to +8484 |
+| Accumulator | 20-bit signed | Conservative sum bound −120000 to +135744 |
+| Sample counter | 4-bit unsigned | 0–15 |
+| Averaged output | 10-bit unsigned | 0–999 |
+
+The widths are selected to avoid signed overflow under the specified maximum nearest-neighbor increment and 16-sample window length.
+
+### 9.5 Sixteen-Sample Boxcar Averaging
+
+The processor accumulates sixteen locally unwrapped phase measurements:
+
+\[
+S=\sum_{n=0}^{15}\Phi_n
+\]
+
+The signed mean is:
+
+\[
+\bar\Phi=\left\lfloor\frac{S}{16}\right\rfloor
+\]
+
+Because the window length is a power of two, division is implemented using arithmetic right shift by four:
+
+```verilog
+mean = next_sum >>> 4;
 ```
 
-This maps increments to `[-500,499]`; exactly 500 counts is ambiguous and assigned the negative direction by convention. Correct tracking requires the *true* intermeasurement phase change to be less than half a beat, with margin for noise.
+For negative sums, arithmetic right shift rounds toward negative infinity. This is the defined v1.0 rounding convention.
 
-For each nonoverlapping 16-pair window, construct a **locally continuous** sequence around the first raw phase of that window and average those 16 values. Retain previous raw phase as necessary for continuity diagnostics, but do not allow an unbounded signed trajectory to accumulate indefinitely. A bounded local representation avoids eventual overflow and makes arithmetic widths derivable.
+The final averaged result is normalized modulo 1000:
 
-`mean = sum(local_unwrapped_phase[0..15]) / 16`
+\[
+\text{avg\_phase}=\bar\Phi\bmod1000
+\]
 
-A right shift by four implements division by 16 for signed fixed-point integers, but `>>> 4` rounds negative values toward minus infinity. Choose and document the desired rounding convention; do not assume nearest-integer rounding.
+with the output restricted to 0–999.
 
-After averaging, normalize the signed mean modulo 1000 to the output range 0..999. **Unwrapping** is for a mathematically meaningful average across 999→0; **final modulo** is for reporting a bounded circular phase. The output is not a continuously accumulated phase trajectory.
+The final modulo operation changes the numerical representation of the average; it does not reverse the benefit of unwrapping before averaging.
 
-**OPEN — arithmetic microarchitecture:** Freeze whether each window is anchored at its first sample or relative to the prior window; derive exact worst-case sum and register widths; define reset/first-sample behavior and signed rounding. Test windows crossing both 999→0 and 0→999, and recovery mid-window. A single `+1000`/`-1000` normalization is valid only after the internal mean range is proven to permit it; otherwise use a bounded multi-step normalization.
+### 9.6 Timing and Output Behavior
+
+The arithmetic block updates its accumulator only when `pair_valid` is asserted.
+
+At the nominal 10 kHz beat rate, accepted differential measurements arrive approximately every 100 µs.
+
+Sixteen accepted pairs therefore produce one averaged output approximately every 1.6 ms under continuous tracking.
+
+The interval between the first and sixteenth accepted measurements is approximately 1.5 ms.
+
+On the sixteenth accepted pair:
+
+- The final sample is included in the accumulated sum.
+- The signed mean is calculated.
+- The result is normalized modulo 1000.
+- `avg_phase` is updated.
+- `avg_valid` is asserted for one sampling-clock cycle.
+
+The next accepted pair begins a new nonoverlapping averaging window.
+
+### 9.7 Reset and Recovery
+
+External reset clears all phase-processing registers.
+
+A `pair_reinit` pulse from the pairing controller invalidates the current averaging window and resets its local arithmetic state.
+
+Any incomplete averaging window is discarded.
+
+The next accepted pair establishes a new `window_base`.
+
+The last published phase value must not be interpreted as a current valid measurement while tracking is lost.
+
+### 9.8 Phase-Cycle Ambiguity
+
+The v1.0 core reports the averaged differential phase modulo 1000.
+
+Phase values differing by integer multiples of 1000 counts are indistinguishable at the output.
+
+The core does not maintain a persistent phase-cycle counter or report unbounded accumulated phase drift.
+
+Long-term phase drift may be reconstructed offline from successive averaged measurements only if phase evolution is sufficiently slow, measurement continuity is maintained, and cycle slips do not introduce ambiguity.
+
+This is an accepted architectural limitation, not an omitted v1.0 feature.
+
+### 9.9 Verification Status — Sprint 3
+
+The corrected phase arithmetic RTL passed the directed `tb_phase_math.v` simulation with:
+
+- 291 checks.
+- 8 averaged outputs.
+- 0 reported errors.
+
+The tests exercised constant differential phase, forward and reverse modulo crossings, negative local means, the half-beat ambiguity convention, large positive steps, recovery during an incomplete averaging window, and idle gaps.
+
+These results establish correctness for the exercised deterministic cases. They do not constitute exhaustive formal verification or end-to-end timing characterization.
+
+### 9.10 Full Pipeline Integration — Sprint 4
+
+The sampling, BVM, sequential pairing, and phase-processing modules have been integrated under the `ddmtd` top-level module.
+
+The integrated datapath operates in the 10 MHz sampling-clock domain and accepts two nominally 9.99 MHz input clocks.
+
+The `tb_ddmtd.v` testbench verifies the complete measurement pipeline using three fixed relative input-clock delays: 0 ns, 20 ns, and 95 ns.
+
+**Observed simulation results:**
+
+| Input delay | Accepted pairs | Averaged outputs | Result |
+|---|---:|---:|---|
+| 0 ns | 116 | 7 | PASS |
+| 20 ns | 116 | 7 | PASS |
+| 95 ns | 116 | 7 | PASS |
+
+The testbench reported zero errors.
+
+These results demonstrate correct integrated operation for the tested static phase offsets and the testbench's acceptance tolerances.
+
+Dynamic phase tracking, phase-slew limits, jitter behavior, frequency-offset tolerance, and physical timing accuracy have not yet been characterized.
+
+UART transmission remains outside the Sprint 4 implementation.
 
 ## 10. Output register and UART
 
@@ -229,7 +408,7 @@ Start with `rtl/ddmtd.v`, `tb/`, and a `Makefile`; generate simulator products u
 | tb_bvm.v        | PASS    | 8 directed checks                                             |
 | tb_sampler.v    | PASS    | 3-FF sampling, MOD-1000 counter, BVM integration              |
 | tb_pairing.v    | PASS    | 9 directed checks                                             |
-| tb_phase_math.v | Planned | Signed arithmetic, modular subtraction, unwrapping, averaging |
+| tb_phase_math.v | PASS    | Modular subtraction, nearest-neighbor unwrapping, 16-sample averaging, signed arithmetic, recovery |
 | tb_ddmtd.v      | Planned | End-to-end nominal phase transfer                             |
 | tb_dynamic.v    | Planned | Steps, ramps, slew, UART                                      |
 | tb_jitter.v     | Planned | Jitter and BVM threshold characterization                     |
@@ -258,21 +437,44 @@ The streaming bit-median concept and three-state stable-low/first-edge/stable-hi
 
 No SoftPLL, PPS alignment, adaptive beat-frequency estimator, oversampling, continuous phase-noise estimator, or extra glitch telemetry is planned for v1.0.
 
-## 15. Open-issue checklist before RTL freeze
+## 15. Open-Issue Checklist Before RTL Freeze
 
-**Completed implementation milestones:**
+### Completed Implementation Milestones
 
 - [x] **BVM:** Implement streaming bit-median correction and programmable qualification.
 - [x] **Sampling:** Integrate matched 3-FF pipelines and shared MOD-1000 counter.
 - [x] **Pairing:** Implement sequential association, two-interval acquisition, baseline suppression, and automatic recovery.
 - [x] **Watchdog:** Implement provisional 500–1500-cycle inter-tag monitoring and sticky fault indication.
+- [x] **Phase arithmetic:** Implement MOD-1000 differential subtraction, nearest-neighbor delta unwrapping, window-local reconstruction, and 16-sample signed averaging.
+- [x] **Arithmetic verification:** Pass 291 directed checks with zero reported errors.
+- [x] **Full pipeline integration:** Connect sampling, BVM, pairing, and phase processing under the `ddmtd` top-level module.
+- [x] **Static integration verification:** Pass 0 ns, 20 ns, and 95 ns relative-phase test cases with 116 accepted pairs and 7 averaged outputs per case; zero reported errors.
 
-**Remaining verification and implementation:**
+### Remaining RTL Implementation
+
+- [ ] **UART:** Implement two-byte 8N1 transmission at approximately 115200 baud.
+- [ ] **UART verification:** Verify byte ordering, framing, baud timing, and decoded phase values.
+- [ ] **Output integration:** Connect UART transmission to `avg_valid` and verify the complete 14-bit interface.
+
+### Remaining Functional Verification
 
 - [ ] **BVM verification:** Complete threshold sweep, publication-latency checks, and pathological transition tests.
 - [ ] **Pairing boundary verification:** Test exact watchdog boundaries, duplicate pending tags, and reset during an incomplete association.
-- [ ] **Arithmetic:** Define local unwrap anchoring, register widths, signed rounding, and final modulo normalization.
-- [ ] **Clock/phase convention:** Verify measured sign and count-to-time scale using controlled phase sweeps.
-- [ ] **Integration:** Verify the complete sampler → BVM → pairing → phase-processing chain.
+- [ ] **Phase-transfer characterization:** Verify phase sign, count-to-time conversion, and transfer behavior over the full modulo-1000 range.
+- [ ] **Dynamic characterization:** Test phase steps, ramps, wrap crossings, response latency, and supported phase-slew limits.
+- [ ] **Jitter characterization:** Evaluate BVM threshold sensitivity, repeatability, and averaging trade-offs.
+- [ ] **Frequency-offset tolerance:** Determine the supported beat-frequency range and watchdog limitations.
+- [ ] **Full regression:** Run all self-checking testbenches against the final RTL with zero unexplained failures.
 
-**Architecture acceptance:** All major blocks are selected. The above items are *behavioral contracts* and verification details, not invitations to expand the project into a new research program.
+### Implementation and Physical Validation
+
+- [ ] **Artix-7 FPGA:** Synthesize, place, route, and verify timing in Vivado; perform board-level characterization.
+- [ ] **SKY130 ASIC:** Complete synthesis, static timing analysis, and physical implementation; collect area, utilization, and critical-path reports.
+
+### Architecture Acceptance
+
+The primary DDMTD measurement datapath is implemented and has passed directed unit and static integration tests.
+
+The remaining RTL development is limited to UART transmission and output integration. Functional characterization and outstanding boundary tests must be completed before declaring the digital core verified.
+
+The design deliberately excludes persistent phase-cycle tracking, adaptive beat-frequency estimation, SoftPLL functionality, and additional telemetry features.

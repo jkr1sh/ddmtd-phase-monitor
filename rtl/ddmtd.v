@@ -1,5 +1,5 @@
-// DDMTD phase monitor - Stage 1: sampling and streaming BVM taggers.
-// Verilog-2005, synthesizable. Not yet a complete differential phase monitor.
+// DDMTD phase monitor - Stages 1-4: BVM sampling, pairing, phase arithmetic, integrated top.
+// Verilog-2005, synthesizable. UART pending; phase-monitor datapath integrated.
 // SPDX-License-Identifier: CERN-OHL-W-2.0+
 // BVM state-machine concept adapted from CERN White Rabbit
 // dmtd_with_deglitcher.vhd by Tomasz Wlostowski; see README for attribution.
@@ -341,4 +341,45 @@ module ddmtd_phase_math (
             end
         end
     end
+endmodule
+
+// Stage 4: integrated phase monitor (UART deliberately deferred).
+// All control and arithmetic runs in the sampling clock domain.
+module ddmtd (
+    input wire clk,
+    input wire rst,
+    input wire [13:0] in,
+    output wire [13:0] out
+);
+    wire [9:0] tag_a, tag_b;
+    wire tag_a_valid, tag_b_valid;
+    wire [9:0] pair_tag_a, pair_tag_b;
+    wire pair_valid, pair_error, tracking_locked, pair_reinit;
+    wire [9:0] avg_phase;
+    wire avg_valid;
+
+    ddmtd_stage1 u_frontend (
+        .clk(clk), .rst(rst),
+        .clk_a(in[0]), .clk_b(in[1]), .bvm_threshold(in[5:2]),
+        .tag_a(tag_a), .tag_b(tag_b),
+        .tag_a_valid(tag_a_valid), .tag_b_valid(tag_b_valid)
+    );
+
+    ddmtd_pairing u_pairing (
+        .clk(clk), .rst(rst),
+        .tag_a(tag_a), .tag_b(tag_b),
+        .tag_a_valid(tag_a_valid), .tag_b_valid(tag_b_valid),
+        .pair_tag_a(pair_tag_a), .pair_tag_b(pair_tag_b),
+        .pair_valid(pair_valid), .pair_error(pair_error),
+        .tracking_locked(tracking_locked), .pair_reinit(pair_reinit)
+    );
+
+    ddmtd_phase_math u_phase_math (
+        .clk(clk), .rst(rst), .pair_reinit(pair_reinit),
+        .pair_tag_a(pair_tag_a), .pair_tag_b(pair_tag_b),
+        .pair_valid(pair_valid), .avg_phase(avg_phase), .avg_valid(avg_valid)
+    );
+
+    // UART will replace the idle-high placeholder in the next sprint.
+    assign out = {tracking_locked, pair_error, 1'b1, avg_valid, avg_phase};
 endmodule
