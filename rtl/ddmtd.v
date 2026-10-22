@@ -116,3 +116,134 @@ module ddmtd_stage1 (
         .tag(tag_b), .tag_valid(tag_b_valid)
     );
 endmodule
+
+// Stage 2: sequential pairing, per-channel beat watchdog, and reacquisition.
+// Verilog-2005. All inputs and outputs are synchronous to clk.
+// A valid strobe is sampled at a rising edge; pair_valid is registered.
+module ddmtd_pairing #(
+    parameter [10:0] MIN_INTERVAL = 11'd500,
+    parameter [10:0] MAX_INTERVAL = 11'd1500
+) (
+    input wire clk,
+    input wire rst,
+    input wire [9:0] tag_a,
+    input wire [9:0] tag_b,
+    input wire tag_a_valid,
+    input wire tag_b_valid,
+    output reg [9:0] pair_tag_a,
+    output reg [9:0] pair_tag_b,
+    output reg pair_valid,
+    output reg pair_error,
+    output reg tracking_locked,
+    output reg pair_reinit
+);
+    localparam [1:0] ACQUIRE = 2'd0, TRACK = 2'd1, RECOVER = 2'd2;
+    reg [1:0] state;
+    reg [10:0] age_a, age_b;
+    reg seen_a, seen_b;
+    reg [1:0] good_a, good_b;
+    reg [9:0] held_a, held_b;
+    reg pending_a, pending_b;
+    reg baseline_pending;
+
+    // Age counts elapsed sampling-clock edges since the last tag.
+    // A tag at MAX_INTERVAL is accepted; absent tags fault once overdue.
+    wire bad_a = seen_a && ((tag_a_valid &&
+                      (((age_a + 11'd1) < MIN_INTERVAL) || ((age_a + 11'd1) > MAX_INTERVAL))) ||
+                      (!tag_a_valid && (age_a >= MAX_INTERVAL)));
+    wire bad_b = seen_b && ((tag_b_valid &&
+                      (((age_b + 11'd1) < MIN_INTERVAL) || ((age_b + 11'd1) > MAX_INTERVAL))) ||
+                      (!tag_b_valid && (age_b >= MAX_INTERVAL)));
+    wire duplicate_a = (state == TRACK) && tag_a_valid && pending_a;
+    wire duplicate_b = (state == TRACK) && tag_b_valid && pending_b;
+    wire fault = bad_a || bad_b || duplicate_a || duplicate_b;
+    wire ready_acquire = (good_a >= 2) && (good_b >= 2);
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= ACQUIRE;
+            age_a <= 0; age_b <= 0;
+            seen_a <= 0; seen_b <= 0;
+            good_a <= 0; good_b <= 0;
+            held_a <= 0; held_b <= 0;
+            pending_a <= 0; pending_b <= 0;
+            baseline_pending <= 0;
+            pair_tag_a <= 0; pair_tag_b <= 0;
+            pair_valid <= 0; pair_error <= 0;
+            tracking_locked <= 0; pair_reinit <= 0;
+        end else begin
+            pair_valid <= 0;
+            pair_reinit <= 0;
+            if (state == RECOVER) begin
+                // Recovery clears timing history but preserves sticky error.
+                state <= ACQUIRE;
+                age_a <= 0; age_b <= 0;
+                seen_a <= 0; seen_b <= 0;
+                good_a <= 0; good_b <= 0;
+                pending_a <= 0; pending_b <= 0;
+                baseline_pending <= 0;
+                tracking_locked <= 0;
+            end else if (fault) begin
+                state <= RECOVER;
+                pair_error <= 1;
+                pair_reinit <= 1;
+                tracking_locked <= 0;
+                pending_a <= 0; pending_b <= 0;
+                baseline_pending <= 0;
+            end else begin
+                // Inter-tag health measurements are independent of pairing.
+                if (tag_a_valid) begin
+                    if (seen_a && good_a < 2) good_a <= good_a + 1'b1;
+                    seen_a <= 1;
+                    age_a <= 0;
+                end else if (seen_a && age_a < MAX_INTERVAL)
+                    age_a <= age_a + 1'b1;
+
+                if (tag_b_valid) begin
+                    if (seen_b && good_b < 2) good_b <= good_b + 1'b1;
+                    seen_b <= 1;
+                    age_b <= 0;
+                end else if (seen_b && age_b < MAX_INTERVAL)
+                    age_b <= age_b + 1'b1;
+
+                case (state)
+                    ACQUIRE: begin
+                        // Qualification is based on registered interval counts.
+                        // Flush startup tags, then use one new pair as baseline.
+                        if (ready_acquire) begin
+                            state <= TRACK;
+                            baseline_pending <= 1;
+                            pending_a <= 0;
+                            pending_b <= 0;
+                        end
+                    end
+                    TRACK: begin
+                        if (tag_a_valid) begin
+                            held_a <= tag_a;
+                            pending_a <= 1;
+                        end
+                        if (tag_b_valid) begin
+                            held_b <= tag_b;
+                            pending_b <= 1;
+                        end
+                        // Includes simultaneous arrivals and either arrival order.
+                        if ((pending_a || tag_a_valid) &&
+                            (pending_b || tag_b_valid)) begin
+                            pair_tag_a <= tag_a_valid ? tag_a : held_a;
+                            pair_tag_b <= tag_b_valid ? tag_b : held_b;
+                            pending_a <= 0;
+                            pending_b <= 0;
+                            if (baseline_pending) begin
+                                baseline_pending <= 0;
+                                tracking_locked <= 1;
+                            end else if (tracking_locked) begin
+                                pair_valid <= 1;
+                            end
+                        end
+                    end
+                    default: state <= RECOVER;
+                endcase
+            end
+        end
+    end
+endmodule

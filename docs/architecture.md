@@ -120,9 +120,11 @@ This is **not** equivalent to zero counting over an arbitrary fixed 1000-sample 
 
 The threshold is programmable through `in[5:2]` (effective 1..15), common to both channels. Start testing at 4 and sweep 1, 2, 4, 8, and 15.
 
-**OPEN — cycle-exact semantics:** Define whether a threshold of H means exactly H consecutive sampled levels; specify count initialization, comparison timing, output-valid pulse timing, and how a zero on the tag-publication cycle is handled. Write a standalone BVM reference model and test all off-by-one cases, including correction across 999→0. An additional design guard may be needed for pathological transition sequences that never reach stable high.
+**Implementation status — Sprint 1:** The streaming BVM estimator has passed eight directed unit checks with zero reported errors. The tests cover clean transitions, multiple sampled reversals, modulo-1000 timestamp correction, threshold-one behavior, interrupted high qualification, and duplicate-tag suppression.
 
-**OPEN — estimator completion latency:** Tags are *reported* after qualification but refer to an earlier corrected transition position. The pairing watchdog must use actual event/report timing appropriately, not confuse them.
+The implemented threshold convention requires H consecutive samples for qualification. The candidate timestamp is captured on the first high sample and incremented modulo 1000 for each subsequent zero until stable-high qualification completes.
+
+**Remaining verification:** Complete the programmable-threshold sweep, check exact publication latency, and investigate pathological sampled sequences that never achieve stable-high qualification. These are verification limitations, not unresolved architectural decisions.ng watchdog must use actual event/report timing appropriately, not confuse them.
 
 ## 7. Sequential tag pairing and health monitoring
 
@@ -141,11 +143,36 @@ Logical control states:
 - `TRACK`: accept sequential fresh tags; produce one `pair_valid` pulse per completed pair.
 - `RECOVER`: latch a fault, invalidate pending/unwrap/average history, then reacquire.
 
+### Tracking acquisition and reacquisition criteria
+
+The pairing controller shall enter `TRACK` only after observing **two consecutive healthy inter-tag intervals on each channel**.
+
+A healthy interval is defined as the elapsed number of sampling-clock cycles between successive valid BVM tags, falling within the configured beat-period tolerance.
+
+- During `ACQUIRE`, monitor the inter-tag intervals of channels A and B independently.
+- Maintain a 2-bit saturating healthy-interval counter per channel.
+- Increment the corresponding counter for each valid inter-tag interval; reset it if the interval violates the permitted range.
+- Assert `tracking_locked` only when both channels have recorded at least two consecutive healthy intervals and a fresh A/B association has been established.
+- Suppress `pair_valid` until tracking is established.
+- On a pairing or watchdog fault, enter `RECOVER`, clear pending tags and healthy-interval counters, invalidate averaging/unwrapping history, and return to `ACQUIRE`.
+
+This is a conservative acquisition policy selected for v1.0, not a requirement inherited from CERN's DDMTD implementation.
+
+**Limitation:** Healthy inter-tag intervals establish nominal event cadence, but do not independently prove correct beat identity or detect every possible missing-event association error.
+
 Per-channel watchdogs measure intervals between successive valid BVM tag strobes. The nominal interval is 1000 `clk` cycles; **1500 cycles is a provisional maximum-gap threshold** for initial tests, not a validated specification. Detect duplicate/unpaired events and absent/late channel activity. On fault, set sticky `pair_error`, deassert tracking, flush partial pair and averaging history, and return to acquisition. Do not reset the free-running counter or both BVM FSMs unless the fault requires it.
 
-**OPEN — critical: startup beat identity.** Sequential A1/B1 association is not guaranteed to be the same physical beat at arbitrary reset release. For a steady periodic signal, pairing adjacent beats may still give the correct *circular* phase; for steps, offsets, or missed tags, it can cause transient or persistent ambiguity. Define the acquisition anchor, permissible transient behavior, and any deliberate one-beat warm-up.
+**Known limitation: startup beat identity.** Sequential A1/B1 association is not guaranteed to be the same physical beat at arbitrary reset release. For a steady periodic signal, pairing adjacent beats may still give the correct *circular* phase; for steps, offsets, or missed tags, it can cause transient or persistent ambiguity. Define the acquisition anchor, permissible transient behavior, and any deliberate one-beat warm-up.
 
-**OPEN — watchdog / recovery policy.** A 1500-cycle per-channel maximum-gap watchdog alone does not detect all dropped tags, false extra tags, or wrong beat associations. Specify minimum plausible inter-tag gap, treatment of simultaneous strobes, priority when a new tag and timeout coincide, fault clear behavior, and how many consecutive good intervals are required before asserting `tracking_locked`. Reacquisition restores normal operation under assumptions; it is **not an absolute proof of correct beat identity**.
+**Implementation status — Sprint 2:** The sequential pairing controller has passed nine directed functional checks with zero reported errors, covering acquisition, baseline suppression, simultaneous pairing, A-first/B-first ordering, early/late event detection, and automatic reacquisition.
+
+The provisional healthy inter-tag interval is 500–1500 sampling-clock cycles, inclusive. Two consecutive healthy intervals per channel are required before baseline association and tracking.
+
+The implementation uses registered outputs and a single-process synchronous FSM. Watchdog timing is based on BVM tag-publication strobes.
+
+Boundary tests at exactly 500 and 1500 cycles, duplicate pending events, and reset during a pending association remain to be verified before declaring exhaustive directed coverage.
+
+**Known limitation:** Healthy event cadence does not guarantee correct beat identity after arbitrary missing or extra events.
 
 **OPEN — frequency tolerance and slew:** Derive permissible deviations in the two input frequencies and maximum step/slew from the beat timing, BVM threshold, and pairing policy. A step that occurs between channel transitions may legitimately produce a mixed-epoch pair; define whether it is flagged, tolerated for one sample, or excluded from error scoring.
 
@@ -197,14 +224,15 @@ UART format: two 8N1 frames, low eight bits first, then upper two bits in the lo
 
 Start with `rtl/ddmtd.v`, `tb/`, and a `Makefile`; generate simulator products under ignored `build/` or `sim/results/` directories. All testbenches are self-checking, use independent reference calculations, and exit nonzero on failure.
 
-| Testbench | Required checks |
-|---|---|
-| `tb_bvm.v` | Clean transitions; isolated high; multiple reversals; threshold sweep; modulo correction; no duplicate tags; exact strobe latency. |
-| `tb_pairing.v` | A-first/B-first; 0..999 circular separations; simultaneous strobes; startup; missing/extra events; watchdog faults; reacquisition. |
-| `tb_phase_math.v` | Widened signed subtraction; MOD 1000; both wrap directions; half-beat ambiguity; 16-sample averaging; negative rounding. |
-| `tb_ddmtd.v` | End-to-end nominal transfer curve and tag cadence; 10 MHz / 9.99 MHz clocks. |
-| `tb_dynamic.v` | Phase steps, ramps, boundary crossings, output latency, UART reconstruction. |
-| `tb_jitter.v` | Deterministic sampled reversals and controlled timing disturbances; threshold-dependent BVM behavior. |
+|    Testbench    |  Status |                            Coverage                           |
+|:---------------:|:-------:|:-------------------------------------------------------------:|
+| tb_bvm.v        | PASS    | 8 directed checks                                             |
+| tb_sampler.v    | PASS    | 3-FF sampling, MOD-1000 counter, BVM integration              |
+| tb_pairing.v    | PASS    | 9 directed checks                                             |
+| tb_phase_math.v | Planned | Signed arithmetic, modular subtraction, unwrapping, averaging |
+| tb_ddmtd.v      | Planned | End-to-end nominal phase transfer                             |
+| tb_dynamic.v    | Planned | Steps, ramps, slew, UART                                      |
+| tb_jitter.v     | Planned | Jitter and BVM threshold characterization                     |
 
 Log timestamped stimulus truth, raw A/B tags, tag-valid strobes, paired tags, raw modular phase, unwrapped/window phase, average, fault/tracking status, and decoded UART output. Explicitly mark transient samples spanning a stimulus change; do not automatically score them against the post-step instantaneous truth.
 
@@ -232,20 +260,19 @@ No SoftPLL, PPS alignment, adaptive beat-frequency estimator, oversampling, cont
 
 ## 15. Open-issue checklist before RTL freeze
 
-**Must resolve before integrated implementation:**
+**Completed implementation milestones:**
 
-- [ ] **BVM:** exact sample-count/threshold/strobe semantics; correction and modulo wrap; pathological no-termination behavior.
-- [ ] **Pairing:** acquisition baseline, event ordering, simultaneous arrivals, missing/extra tags, recovery and tracking qualification.
-- [ ] **Watchdog:** derive upper/lower interval limits and BVM latency margin; distinguish a missing beat from valid phase separation.
-- [ ] **Arithmetic:** local unwrap anchoring, widths, overflow bounds, signed rounding, and final modulo normalization.
-- [ ] **Clock/phase convention:** measured sign and count-to-time scale established by a controlled phase sweep.
+- [x] **BVM:** Implement streaming bit-median correction and programmable qualification.
+- [x] **Sampling:** Integrate matched 3-FF pipelines and shared MOD-1000 counter.
+- [x] **Pairing:** Implement sequential association, two-interval acquisition, baseline suppression, and automatic recovery.
+- [x] **Watchdog:** Implement provisional 500–1500-cycle inter-tag monitoring and sticky fault indication.
 
-**Can resolve during integration/characterization:**
+**Remaining verification and implementation:**
 
-- [ ] Threshold-change policy (recommend hold constant outside reset).
-- [ ] UART busy/pending/overflow policy.
-- [ ] Basys 3 clock source, constraints, and board test setup.
-- [ ] SKY130 constraints, corner, CDC implementation, and physical reports.
-- [ ] Parameter justification: characterize threshold values and 16-sample noise/latency tradeoff; use device data for synchronizer MTBF claims.
+- [ ] **BVM verification:** Complete threshold sweep, publication-latency checks, and pathological transition tests.
+- [ ] **Pairing boundary verification:** Test exact watchdog boundaries, duplicate pending tags, and reset during an incomplete association.
+- [ ] **Arithmetic:** Define local unwrap anchoring, register widths, signed rounding, and final modulo normalization.
+- [ ] **Clock/phase convention:** Verify measured sign and count-to-time scale using controlled phase sweeps.
+- [ ] **Integration:** Verify the complete sampler → BVM → pairing → phase-processing chain.
 
 **Architecture acceptance:** All major blocks are selected. The above items are *behavioral contracts* and verification details, not invitations to expand the project into a new research program.
