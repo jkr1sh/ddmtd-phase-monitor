@@ -1,6 +1,11 @@
+# Simulation outputs
 build/
+results/
 *.vvp
 *.vcd
-*.fst
-*.log
+
+# Python
+__pycache__/
+*.pyc
+
 .DS_Store

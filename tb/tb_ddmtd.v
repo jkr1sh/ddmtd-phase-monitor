@@ -15,6 +15,53 @@ module tb_ddmtd;
     ddmtd dut20(.clk(clk), .rst(rst), .in(in20), .out(out20));
     ddmtd dut95(.clk(clk), .rst(rst), .in(in95), .out(out95));
 
+    // Passive monitors (enabled only for characterization builds).
+`ifdef DDMTD_LOGGING
+    ddmtd_monitor #(.CASE_ID(0)) mon0 (
+        .clk(clk), .rst(rst), .threshold(in0[5:2]),
+        .tag_a(dut0.tag_a), .tag_b(dut0.tag_b),
+        .tag_a_valid(dut0.tag_a_valid), .tag_b_valid(dut0.tag_b_valid),
+        .pair_tag_a(dut0.pair_tag_a), .pair_tag_b(dut0.pair_tag_b),
+        .pair_valid(dut0.pair_valid), .pair_reinit(dut0.pair_reinit),
+        .avg_phase(dut0.avg_phase), .avg_valid(dut0.avg_valid),
+        .pair_error(dut0.pair_error), .tracking_locked(dut0.tracking_locked));
+    ddmtd_monitor #(.CASE_ID(20)) mon20 (
+        .clk(clk), .rst(rst), .threshold(in20[5:2]),
+        .tag_a(dut20.tag_a), .tag_b(dut20.tag_b),
+        .tag_a_valid(dut20.tag_a_valid), .tag_b_valid(dut20.tag_b_valid),
+        .pair_tag_a(dut20.pair_tag_a), .pair_tag_b(dut20.pair_tag_b),
+        .pair_valid(dut20.pair_valid), .pair_reinit(dut20.pair_reinit),
+        .avg_phase(dut20.avg_phase), .avg_valid(dut20.avg_valid),
+        .pair_error(dut20.pair_error), .tracking_locked(dut20.tracking_locked));
+    ddmtd_monitor #(.CASE_ID(95)) mon95 (
+        .clk(clk), .rst(rst), .threshold(in95[5:2]),
+        .tag_a(dut95.tag_a), .tag_b(dut95.tag_b),
+        .tag_a_valid(dut95.tag_a_valid), .tag_b_valid(dut95.tag_b_valid),
+        .pair_tag_a(dut95.pair_tag_a), .pair_tag_b(dut95.pair_tag_b),
+        .pair_valid(dut95.pair_valid), .pair_reinit(dut95.pair_reinit),
+        .avg_phase(dut95.avg_phase), .avg_valid(dut95.avg_valid),
+        .pair_error(dut95.pair_error), .tracking_locked(dut95.tracking_locked));
+`endif
+
+    // Independent serial decoding against published averages.
+`ifdef DDMTD_LOGGING
+    ddmtd_uart_checker #(.CASE_ID(0)) uart_check0 (
+        .clk(clk), .rst(rst), .avg_phase(out0[9:0]),
+        .avg_valid(out0[10]), .tx(out0[11]));
+    ddmtd_uart_checker #(.CASE_ID(20)) uart_check20 (
+        .clk(clk), .rst(rst), .avg_phase(out20[9:0]),
+        .avg_valid(out20[10]), .tx(out20[11]));
+    ddmtd_uart_checker #(.CASE_ID(95)) uart_check95 (
+        .clk(clk), .rst(rst), .avg_phase(out95[9:0]),
+        .avg_valid(out95[10]), .tx(out95[11]));
+`endif
+
+`ifdef DDMTD_LOGGING
+    initial $display("DEBUG: DDMTD_LOGGING IS ENABLED");
+`else
+    initial $display("DEBUG: DDMTD_LOGGING IS DISABLED");
+`endif
+
     // 9.99001 MHz nominal: input period = 100100 ps.
     always #50.050 clk_a = ~clk_a;
     always #50.050 clk_b0 = ~clk_b0;
@@ -89,6 +136,11 @@ module tb_ddmtd;
             $display("FAIL insufficient averaged outputs");
             errors = errors + 1;
         end
+`ifdef DDMTD_LOGGING
+        uart_check0.check_complete();
+        uart_check20.check_complete();
+        uart_check95.check_complete();
+`endif
         if (errors) $fatal(1, "DDMTD integration FAILED");
         $display("PASS: DDMTD integration (0, 20, 95 ns)");
         $finish;
