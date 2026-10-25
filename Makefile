@@ -6,7 +6,9 @@ RTL      := rtl/ddmtd.v
 TB       := tb/$(TOP).v
 SIM      := build/$(TOP).vvp
 
-.PHONY: all sim clean
+TESTS    := tb_bvm tb_sampler tb_pairing tb_phase_math tb_ddmtd tb_uart
+
+.PHONY: all sim regression clean
 
 all: sim
 
@@ -16,6 +18,14 @@ $(SIM): $(RTL) $(TB)
 
 sim: $(SIM)
 	$(VVP) $(SIM)
+
+regression:
+	@set -e; \
+	for tb in $(TESTS); do \
+		echo "=== Running $$tb ==="; \
+		$(MAKE) sim TOP=$$tb; \
+	done
+	@echo "PASS: All regression tests"
 
 clean:
 	rm -rf build

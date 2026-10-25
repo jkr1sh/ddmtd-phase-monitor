@@ -1,6 +1,11 @@
 # DDMTD Phase Monitor — Architecture Specification
 
-**Status:** Proposed v1.0 architecture; implementation details marked **OPEN** must be resolved before RTL freeze.  
+**Status:** v1.0 RTL implementation complete.
+Directed unit and integration regression passed.
+Extended functional characterization and physical validation pending.
+**Implementation baseline:** Synthesizable Verilog-2005.
+**Verification continuation:** See `verification_plan.md`.
+
 **Target:** Synthesizable Verilog-2005; functional simulation → Artix-7 (Basys 3) → SKY130 standard-cell implementation.  
 **Scope:** Compact, two-channel digital DMTD phase monitor; not a White Rabbit SoftPLL or a calibrated picosecond instrument.
 
@@ -397,25 +402,95 @@ At every completed 16-pair window:
 
 UART format: two 8N1 frames, low eight bits first, then upper two bits in the low bits of the second byte (upper six bits zero). At 10 MHz, 87 cycles/bit gives `10 MHz / 87 ≈ 114942.5 baud` (~-0.22% relative to 115200).
 
-**OPEN — UART buffering:** Define whether a new result arriving while busy is queued, overwrites a pending latest-value slot, or asserts an overflow fault. Nominal averages arrive about every 1.6 ms, while two UART frames require about 174 us, so a one-entry pending buffer is adequate nominally, but its exceptional behavior must be explicit.
+### UART Buffering
+
+The UART transmitter uses a one-entry latest-value pending buffer.
+
+- When idle, a new `avg_valid` result starts transmission.
+- While transmitting, a new result is stored in the pending buffer.
+- If another result arrives while the buffer is occupied, it replaces
+  the previous pending value.
+- After the current two-byte transmission completes, the pending
+  result is transmitted.
+- If a new result arrives while a pending result is being launched,
+  the pending result is transmitted and the new result is retained.
+- Reset clears the pending buffer and returns UART TX to idle high.
+
+This is a latest-value buffering policy, not a lossless FIFO.
+Intermediate results may be discarded during sustained overload.
+
+At the nominal operating point, averages arrive approximately
+every 1.6 ms, while a two-byte UART transmission requires
+approximately 174 us.
+
+The UART interface transmits:
+
+- Byte 0: `avg_phase[7:0]`
+- Byte 1: `{6'b000000, avg_phase[9:8]}`
+
+Each byte uses 8N1 framing, transmitted LSB-first.
+
+Baud divisor: 87 cycles at 10 MHz.
+Effective baud rate: approximately 114942.5 baud.
+
+### Sprint 5 — UART Implementation and Directed Verification
+
+The two-byte UART transmitter has been integrated into the
+`ddmtd` top-level module.
+
+The transmitter accepts the registered 10-bit averaged phase
+and its one-cycle valid strobe.
+
+The top-level output mapping is:
+
+- `out[9:0]`: averaged phase
+- `out[10]`: average-valid pulse
+- `out[11]`: UART TX
+- `out[12]`: sticky pairing/watchdog fault
+- `out[13]`: tracking status
+
+#### Directed Verification Results
+
+Testbench: `tb_uart.v`
+
+Observed results:
+
+- 13 directed checks
+- 0 reported errors
+- UART directed tests: PASS
+- Full six-testbench regression: PASS
+
+The directed UART tests exercise transmission behavior and
+selected byte values.
+
+These results do not yet establish complete end-to-end UART
+correctness under dynamic DDMTD operation.
+
+Extended UART decoding, timestamp correlation, and comparison
+against actual averaged measurements are deferred to the
+characterization phase.
 
 ## 11. Verification strategy
 
 Start with `rtl/ddmtd.v`, `tb/`, and a `Makefile`; generate simulator products under ignored `build/` or `sim/results/` directories. All testbenches are self-checking, use independent reference calculations, and exit nonzero on failure.
 
-|    Testbench    |  Status |                            Coverage                           |
-|:---------------:|:-------:|:-------------------------------------------------------------:|
-| tb_bvm.v        | PASS    | 8 directed checks                                             |
-| tb_sampler.v    | PASS    | 3-FF sampling, MOD-1000 counter, BVM integration              |
-| tb_pairing.v    | PASS    | 9 directed checks                                             |
-| tb_phase_math.v | PASS    | Modular subtraction, nearest-neighbor unwrapping, 16-sample averaging, signed arithmetic, recovery |
-| tb_ddmtd.v      | Planned | End-to-end nominal phase transfer                             |
-| tb_dynamic.v    | Planned | Steps, ramps, slew, UART                                      |
-| tb_jitter.v     | Planned | Jitter and BVM threshold characterization                     |
 
-Log timestamped stimulus truth, raw A/B tags, tag-valid strobes, paired tags, raw modular phase, unwrapped/window phase, average, fault/tracking status, and decoded UART output. Explicitly mark transient samples spanning a stimulus change; do not automatically score them against the post-step instantaneous truth.
+| Testbench | Status | Coverage |
+|---|---|---|
+| `tb_bvm.v` | PASS | Streaming BVM estimator, directed transitions and correction |
+| `tb_sampler.v` | PASS | 3-FF sampling, shared MOD-1000 timebase |
+| `tb_pairing.v` | PASS | Sequential pairing, acquisition, watchdog and recovery |
+| `tb_phase_math.v` | PASS | Modular arithmetic, unwrapping and 16-sample averaging |
+| `tb_ddmtd.v` | PASS | Full datapath, static offsets of 0 ns, 20 ns and 95 ns |
+| `tb_uart.v` | PASS | Directed UART transmission and framing checks |
 
-**Pass criterion:** No unexplained assertion failures in the specified operating region, reproducible logs, and clearly documented limitations. Functional simulation alone does not validate analog timing accuracy or metastability MTBF.
+**Regression status:** All six testbenches passed with zero reported errors.
+
+These are directed functional results, not exhaustive verification.
+
+Extended phase-transfer, dynamic, jitter, fault-injection and
+end-to-end UART characterization are specified separately in
+`verification_plan.md`.
 
 ## 12. FPGA phase (later)
 
@@ -437,44 +512,66 @@ The streaming bit-median concept and three-state stable-low/first-edge/stable-hi
 
 No SoftPLL, PPS alignment, adaptive beat-frequency estimator, oversampling, continuous phase-noise estimator, or extra glitch telemetry is planned for v1.0.
 
-## 15. Open-Issue Checklist Before RTL Freeze
 
-### Completed Implementation Milestones
+## 15. RTL Implementation Closeout — Sprints 1–5
 
-- [x] **BVM:** Implement streaming bit-median correction and programmable qualification.
-- [x] **Sampling:** Integrate matched 3-FF pipelines and shared MOD-1000 counter.
-- [x] **Pairing:** Implement sequential association, two-interval acquisition, baseline suppression, and automatic recovery.
-- [x] **Watchdog:** Implement provisional 500–1500-cycle inter-tag monitoring and sticky fault indication.
-- [x] **Phase arithmetic:** Implement MOD-1000 differential subtraction, nearest-neighbor delta unwrapping, window-local reconstruction, and 16-sample signed averaging.
-- [x] **Arithmetic verification:** Pass 291 directed checks with zero reported errors.
-- [x] **Full pipeline integration:** Connect sampling, BVM, pairing, and phase processing under the `ddmtd` top-level module.
-- [x] **Static integration verification:** Pass 0 ns, 20 ns, and 95 ns relative-phase test cases with 116 accepted pairs and 7 averaged outputs per case; zero reported errors.
+### 15.1 Completed Implementation
 
-### Remaining RTL Implementation
+- [x] Streaming BVM transition estimator
+- [x] Matched 3-FF input sampling pipelines
+- [x] Shared modulo-1000 timebase
+- [x] Sequential tag pairing and acquisition
+- [x] Beat-period watchdog and automatic recovery
+- [x] Modular differential phase subtraction
+- [x] Window-local nearest-neighbor unwrapping
+- [x] Sixteen-sample signed boxcar averaging
+- [x] Two-byte UART transmitter
+- [x] One-entry latest-value UART pending buffer
+- [x] Complete 14-bit top-level output integration
 
-- [ ] **UART:** Implement two-byte 8N1 transmission at approximately 115200 baud.
-- [ ] **UART verification:** Verify byte ordering, framing, baud timing, and decoded phase values.
-- [ ] **Output integration:** Connect UART transmission to `avg_valid` and verify the complete 14-bit interface.
+### 15.2 Completed Directed Verification
 
-### Remaining Functional Verification
+- [x] BVM unit tests
+- [x] Sampling integration tests
+- [x] Pairing and watchdog directed tests
+- [x] Phase arithmetic directed tests
+- [x] Full datapath static integration tests
+- [x] UART directed tests
+- [x] Six-testbench regression
 
-- [ ] **BVM verification:** Complete threshold sweep, publication-latency checks, and pathological transition tests.
-- [ ] **Pairing boundary verification:** Test exact watchdog boundaries, duplicate pending tags, and reset during an incomplete association.
-- [ ] **Phase-transfer characterization:** Verify phase sign, count-to-time conversion, and transfer behavior over the full modulo-1000 range.
-- [ ] **Dynamic characterization:** Test phase steps, ramps, wrap crossings, response latency, and supported phase-slew limits.
-- [ ] **Jitter characterization:** Evaluate BVM threshold sensitivity, repeatability, and averaging trade-offs.
-- [ ] **Frequency-offset tolerance:** Determine the supported beat-frequency range and watchdog limitations.
-- [ ] **Full regression:** Run all self-checking testbenches against the final RTL with zero unexplained failures.
+All reported directed regression tests passed with
+zero errors.
 
-### Implementation and Physical Validation
+### 15.3 Outstanding Verification
 
-- [ ] **Artix-7 FPGA:** Synthesize, place, route, and verify timing in Vivado; perform board-level characterization.
-- [ ] **SKY130 ASIC:** Complete synthesis, static timing analysis, and physical implementation; collect area, utilization, and critical-path reports.
+The following activities are tracked in
+`verification_plan.md`:
 
-### Architecture Acceptance
+- Phase-transfer sweep and physical sign convention
+- Dynamic phase steps, ramps and slew limits
+- Jitter and BVM threshold sensitivity
+- Frequency-offset tolerance
+- Watchdog boundary and recovery verification
+- End-to-end UART measurement correlation
+- Reproducible CSV logging and plotting
 
-The primary DDMTD measurement datapath is implemented and has passed directed unit and static integration tests.
+### 15.4 Physical Implementation
 
-The remaining RTL development is limited to UART transmission and output integration. Functional characterization and outstanding boundary tests must be completed before declaring the digital core verified.
+- [ ] Artix-7 synthesis, implementation and timing closure
+- [ ] FPGA board-level functional characterization
+- [ ] SKY130 synthesis and static timing analysis
+- [ ] SKY130 physical implementation
 
-The design deliberately excludes persistent phase-cycle tracking, adaptive beat-frequency estimation, SoftPLL functionality, and additional telemetry features.
+### 15.5 Acceptance Statement
+
+The v1.0 RTL implementation is feature-complete for
+the specified architecture.
+
+Directed functional regression has passed.
+
+The design is not yet characterized for physical
+timing accuracy, phase noise, jitter sensitivity,
+dynamic tracking limits, or frequency-offset tolerance.
+
+RTL freeze and final verification acceptance remain
+pending the characterization programme.

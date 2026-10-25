@@ -343,7 +343,7 @@ module ddmtd_phase_math (
     end
 endmodule
 
-// Stage 4: integrated phase monitor (UART deliberately deferred).
+// Stage 5: integrated phase monitor with two-byte UART readout.
 // All control and arithmetic runs in the sampling clock domain.
 module ddmtd (
     input wire clk,
@@ -380,6 +380,91 @@ module ddmtd (
         .pair_valid(pair_valid), .avg_phase(avg_phase), .avg_valid(avg_valid)
     );
 
-    // UART will replace the idle-high placeholder in the next sprint.
-    assign out = {tracking_locked, pair_error, 1'b1, avg_valid, avg_phase};
+    wire uart_tx;
+    ddmtd_uart_tx u_uart (
+        .clk(clk), .rst(rst), .phase(avg_phase),
+        .phase_valid(avg_valid), .tx(uart_tx)
+    );
+    assign out = {tracking_locked, pair_error, uart_tx, avg_valid, avg_phase};
+endmodule
+
+// Two-byte, 8N1 UART transmitter. Each frame: start, 8 LSB-first data, stop.
+// New samples while busy occupy a one-entry latest-value pending slot.
+// Repeated busy-time arrivals replace that pending value.
+module ddmtd_uart_tx #(
+    parameter [7:0] CLKS_PER_BIT = 8'd87
+) (
+    input wire clk,
+    input wire rst,
+    input wire [9:0] phase,
+    input wire phase_valid,
+    output reg tx
+);
+    reg [19:0] shift_bits;
+    reg [7:0] baud_count;
+    reg [4:0] bits_left;
+    reg busy;
+    reg pending_valid;
+    reg [9:0] pending_phase;
+
+    function [19:0] encode;
+        input [9:0] value;
+        begin
+            // MSB..LSB: stop2, byte2, start2, stop1, byte1, start1
+            encode = {1'b1, 6'b000000, value[9:8], 1'b0,
+                      1'b1, value[7:0], 1'b0};
+        end
+    endfunction
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            tx <= 1'b1;
+            shift_bits <= 20'hfffff;
+            baud_count <= 8'd0;
+            bits_left <= 5'd0;
+            busy <= 1'b0;
+            pending_valid <= 1'b0;
+            pending_phase <= 10'd0;
+        end else begin
+            if (busy) begin
+                if (phase_valid) begin
+                    pending_phase <= phase;
+                    pending_valid <= 1'b1;
+                end
+                if (baud_count == CLKS_PER_BIT - 1'b1) begin
+                    baud_count <= 8'd0;
+                    if (bits_left == 5'd1) begin
+                        busy <= 1'b0;
+                        bits_left <= 5'd0;
+                        tx <= 1'b1;
+                    end else begin
+                        shift_bits <= {1'b1, shift_bits[19:1]};
+                        tx <= shift_bits[1];
+                        bits_left <= bits_left - 1'b1;
+                    end
+                end else begin
+                    baud_count <= baud_count + 1'b1;
+                end
+            end else if (pending_valid) begin
+                // Drain the pending sample; a simultaneous new sample
+                // becomes the next pending value rather than being lost.
+                shift_bits <= encode(pending_phase);
+                tx <= 1'b0;
+                busy <= 1'b1;
+                bits_left <= 5'd20;
+                baud_count <= 8'd0;
+                pending_valid <= phase_valid;
+                if (phase_valid)
+                    pending_phase <= phase;
+            end else if (phase_valid) begin
+                shift_bits <= encode(phase);
+                tx <= 1'b0;
+                busy <= 1'b1;
+                bits_left <= 5'd20;
+                baud_count <= 8'd0;
+            end else begin
+                tx <= 1'b1;
+            end
+        end
+    end
 endmodule
